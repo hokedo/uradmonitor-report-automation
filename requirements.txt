@@ -1,0 +1,5 @@
+aiohttp==3.8.1
+pandas==1.4.3
+XlsxWriter==3.0.3
+python-dotenv==0.21.0
+typer==0.7.0
