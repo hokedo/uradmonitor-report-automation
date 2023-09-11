@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from math import ceil
 from pathlib import Path
+from typing import Optional
 
 import aiohttp
 import pandas
@@ -46,6 +47,41 @@ def unix_timestamp_to_datetime(timestamp):
     return datetime.utcfromtimestamp(timestamp).replace(tzinfo=timezone.utc).astimezone(tz=None)
 
 
+def seconds_since(timestamp):
+    return int((datetime.now().astimezone(tz=None) - timestamp).total_seconds())
+
+
+def get_last_date_of_month(year: int, month: int) -> datetime:
+    """Return the last date of the month.
+
+    Args:
+        year (int): Year, i.e. 2022
+        month (int): Month, i.e. 1 for January
+
+    Returns:
+        date (datetime): Last date of the current month
+    """
+
+    if month == 12:
+        # Edge case since datetime won't allow month 13 (from below code: month + 1)
+        return datetime(year, month, 31).astimezone(tz=None)
+    else:
+        return datetime(year, month + 1, 1).astimezone(tz=None) + timedelta(days=-1)
+
+
+def generate_month_start_end_dates(start: datetime, end: datetime) -> tuple[datetime, datetime]:
+    assert start <= end, 'Starting date must be earlier or equal to ending date'
+
+    while start <= end:
+        month_end = get_last_date_of_month(start.year, start.month)
+        if month_end > end:
+            month_end = end
+
+        yield start, month_end
+
+        start = month_end + timedelta(days=1)
+
+
 async def get_sensor_list(session, device_id):
     logger.info(f'Fetching sensor list for device:\t{device_id}')
     url = f'https://data.uradmonitor.com/api/v1/devices/{device_id}'
@@ -66,16 +102,13 @@ async def get_sensor_data(session, device_id, sensor, start_interval=None, end_i
         f"Fetching sensor data for device:\t{device_id}\t{sensor}\t{start_interval}\t{end_interval}\t{start_date}\t{end_date}")
     path = '/'.join(str(item) for item in [device_id, sensor, start_interval, end_interval] if item)
     url = f'https://data.uradmonitor.com/api/v1/devices/{path}/'
-    # return requests.get(
-    #     f'https://data.uradmonitor.com/api/v1/devices/{path}/',
-    # f'https://data.uradmonitor.com/api/v1/devices/{device_id}/{sensor}/5184000',
-    # f'http://data.uradmonitor.com/api/v1/devices/13000001/temperature/600/480',
-    # headers=AUTH_HEADERS
-    # ).json()
     return await fetch_json(session, url)
 
 
-async def fetch_data(start_date):
+async def fetch_data(start_date, end_date=None):
+    if end_date is None:
+        end_date = datetime.now().astimezone(tz=None)
+
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=10, force_close=True)) as session:
         all_devices = await get_device_list(session)
         device_sensors = await asyncio.gather(*[
@@ -92,14 +125,13 @@ async def fetch_data(start_date):
                     sensor_device_map[sensor]['measure_unit'] = sensor_info[1]
                     sensor_device_map[sensor]['devices'].append(device)
 
-        now = datetime.now().astimezone(tz=None)
-        months = ceil((now - start_date).days / 31)
-
         for sensor, sensor_info in sensor_device_map.items():
             sensor_data = []
-            for month in range(months):
-                start_interval = int((now - (start_date + timedelta(days=31) * month)).total_seconds())
-                end_interval = int((now - (start_date + timedelta(days=31) * (month + 1))).total_seconds())
+            for start_interval, end_interval in generate_month_start_end_dates(start_date, end_date):
+                start_interval = seconds_since(start_interval)
+
+                end_interval = end_interval.replace(hour=23, minute=59, second=59)
+                end_interval = seconds_since(end_interval)
 
                 if end_interval <= 0:
                     end_interval = None
@@ -180,14 +212,17 @@ def create_spreadsheet(data, sensor_name, measure_unit, reports_folder_path=Path
     writer.save()
 
 
-async def run_report_generation(start_date):
+async def run_report_generation(start_date, end_date=None):
     start_date = start_date.astimezone(tz=None)
-    async for data, sensor_name, measure_unit in fetch_data(start_date):
+    if end_date is not None:
+        end_date = end_date.astimezone(tz=None)
+
+    async for data, sensor_name, measure_unit in fetch_data(start_date, end_date):
         create_spreadsheet(data, sensor_name, measure_unit)
 
 
-def main(start_date: datetime):
-    asyncio.run(run_report_generation(start_date))
+def main(start_date: datetime, end_date: Optional[datetime]):
+    asyncio.run(run_report_generation(start_date, end_date))
 
 
 if __name__ == "__main__":
