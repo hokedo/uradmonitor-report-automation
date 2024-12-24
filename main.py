@@ -4,7 +4,7 @@ import logging
 import os
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from math import ceil
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -25,12 +25,35 @@ AUTH_HEADERS = {
     'X-User-hash': USER_HASH
 }
 
+
+class Granularity(str, Enum):
+    daily = 'daily'
+    monthly = 'monthly'
+    yearly = 'yearly'
+
 logger = logging.getLogger()
 
 
-async def fetch_json(session, url):
-    async with session.get(url, headers=AUTH_HEADERS) as response:
-        return await response.json()
+
+
+async def fetch_json(session: aiohttp.ClientSession, url: str, retry_times: Optional[int] = 3):
+    retries_left = retry_times
+
+    while retries_left > 0:
+        try:
+            async with session.get(url, headers=AUTH_HEADERS) as response:
+                response.raise_for_status()  # Raises an exception for 4xx/5xx responses
+                return await response.json()
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            retries_left -= 1
+            if retries_left > 0:
+                wait_time = (retry_times - retries_left) * 2  # Increasing wait time on each retry
+                print(f"Error fetching data from {url}. Retrying in {wait_time} seconds... ({retries_left} retries left)")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"Failed to fetch data from {url} after {retry_times} attempts.")
+                raise e  # Re-raise the exception after all retries are exhausted
 
 
 async def get_device_list(session):
@@ -176,34 +199,47 @@ def create_chart(df, workbook, sheet_name, sensor_name, measurement_unit):
     return chart
 
 
-def create_spreadsheet(data, sensor_name, measure_unit, reports_folder_path=Path('reports')):
-    logger.info(f'Creating excel report for:\t{sensor_name}')
 
+def create_spreadsheet(data, sensor_name, measure_unit, granularity='daily', reports_folder_path=Path('reports')):
+    logger.info(f'Creating {granularity} excel report for:\t{sensor_name}')
+
+    # Flatten the data from each device into a single list
     data = [entry_data for device_data in data for entry_data in device_data]
     df = pandas.DataFrame.from_dict(data).dropna()
 
+    # Convert timestamps to datetime
     df['datetime'] = df['time'].apply(lambda x: unix_timestamp_to_datetime(x))
-    df['date'] = df['datetime'].apply(lambda x: x.strftime('%Y-%m-%d'))
 
-    average_per_day = df.groupby('date')[sensor_name].mean().reset_index()
-    average_per_day = average_per_day.set_index('date')
-    average_per_day_per_device = df.groupby(['device_id', 'date'])[sensor_name].mean().reset_index()
-    average_per_day_per_device = average_per_day_per_device.set_index('date')
+    # Generate intervals based on granularity
+    df['interval'] = generate_intervals(df, granularity)
 
+    # Calculate the mean based on the granularity
+    average_per_interval, average_per_interval_per_device = calculate_mean(df, sensor_name)
+
+    # Create reports folder if it doesn't exist
     if not reports_folder_path.exists():
         reports_folder_path.mkdir(parents=True)
     elif not reports_folder_path.is_dir():
         raise Exception(f"Location for reports '{reports_folder_path}' is a file! Need a folder")
 
-    report_path = reports_folder_path / f'{sensor_name}_report.xlsx'
+    # Determine the interval range for the report name
+    start_interval = df['interval'].min()
+    end_interval = df['interval'].max()
+    interval_str = f'{start_interval}-{end_interval}'
+
+    # Construct the report file name
+    report_path = reports_folder_path / f'{sensor_name}_{granularity}_report_{interval_str}.xlsx'
 
     # Create a Pandas Excel writer using XlsxWriter as the engine.
     writer = pandas.ExcelWriter(report_path, engine='xlsxwriter')
-    average_per_day.to_excel(writer, sheet_name='all')
-    chart = create_chart(average_per_day, writer.book, 'all', sensor_name, measure_unit)
+
+    # Write the overall average to Excel
+    average_per_interval.to_excel(writer, sheet_name='all')
+    chart = create_chart(average_per_interval, writer.book, 'all', sensor_name, measure_unit)
     writer.sheets['all'].insert_chart('D5', chart, {'x_scale': 2, 'y_scale': 1})
 
-    for group_name, df_group in average_per_day_per_device.groupby('device_id'):
+    # Write the average per device to Excel
+    for group_name, df_group in average_per_interval_per_device.groupby('device_id'):
         df_group[sensor_name].to_excel(writer, sheet_name=group_name)
         chart = create_chart(df_group, writer.book, group_name, sensor_name, measure_unit)
         writer.sheets[group_name].insert_chart('D5', chart, {'x_scale': 2, 'y_scale': 1})
@@ -211,18 +247,46 @@ def create_spreadsheet(data, sensor_name, measure_unit, reports_folder_path=Path
     # Close the Pandas Excel writer and output the Excel file.
     writer.save()
 
+def generate_intervals(df, granularity):
+    """
+    Generate intervals based on the specified granularity (daily, monthly, yearly).
+    """
+    if granularity == 'daily':
+        return df['datetime'].apply(lambda x: x.strftime('%Y-%m-%d'))
+    elif granularity == 'monthly':
+        return df['datetime'].apply(lambda x: x.strftime('%Y-%m'))
+    elif granularity == 'yearly':
+        return df['datetime'].apply(lambda x: x.strftime('%Y'))
+    else:
+        raise ValueError(f"Invalid granularity '{granularity}' provided. Use 'daily', 'monthly', or 'yearly'.")
 
-async def run_report_generation(start_date, end_date=None):
+def calculate_mean(df, sensor_name):
+    """
+    Calculate the mean of the sensor data based on the provided intervals.
+    Returns two DataFrames: overall average and per-device average.
+    """
+    # Calculate the overall average for each interval
+    average_per_interval = df.groupby('interval')[sensor_name].mean().reset_index()
+    average_per_interval = average_per_interval.set_index('interval')
+
+    # Calculate the average per device for each interval
+    average_per_interval_per_device = df.groupby(['device_id', 'interval'])[sensor_name].mean().reset_index()
+    average_per_interval_per_device = average_per_interval_per_device.set_index('interval')
+
+    return average_per_interval, average_per_interval_per_device
+
+
+async def run_report_generation(start_date, end_date=None, granularity: Granularity = Granularity.daily):
     start_date = start_date.astimezone(tz=None)
     if end_date is not None:
         end_date = end_date.astimezone(tz=None)
 
     async for data, sensor_name, measure_unit in fetch_data(start_date, end_date):
-        create_spreadsheet(data, sensor_name, measure_unit)
+        create_spreadsheet(data, sensor_name, measure_unit, granularity.value)
 
 
-def main(start_date: datetime, end_date: Optional[datetime]):
-    asyncio.run(run_report_generation(start_date, end_date))
+def main(start_date: datetime, end_date: Optional[datetime], granularity: Granularity = Granularity.daily):
+    asyncio.run(run_report_generation(start_date, end_date, granularity))
 
 
 if __name__ == "__main__":
